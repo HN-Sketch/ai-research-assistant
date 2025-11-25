@@ -80,7 +80,7 @@ def is_mobile():
 def init_client():
     return OpenAI(
         base_url="https://openrouter.ai/api/v1",
-        api_key="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",
+        api_key=st.secrets["OPENROUTER_API_KEY"],  # 使用secrets
     )
 
 client = init_client()
