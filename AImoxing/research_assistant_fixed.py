@@ -294,12 +294,23 @@ def process_user_input(user_input, temperature, max_tokens):
                 })
                 
         except Exception as e:
-            error_msg = f"❌ 请求失败：{str(e)}"
-            st.error(error_msg)
-            st.session_state.chat_history.append({
-                "role": "assistant", 
-                "content": error_msg
-            })
+    # 显示更详细的错误信息
+         st.error(f"❌ 详细错误信息：{str(e)}")
+    
+    # 检查API密钥是否存在
+         if "OPENROUTER_API_KEY" not in st.secrets:
+          st.error("❌ 在Streamlit Secrets中未找到 OPENROUTER_API_KEY")
+         else:
+          st.info(f"✅ API密钥已配置，长度: {len(st.secrets['OPENROUTER_API_KEY'])} 字符")
+    
+    # 显示完整的错误信息
+         import traceback
+         st.code(traceback.format_exc())
+    
+         st.session_state.chat_history.append({
+        "role": "assistant", 
+        "content": f"请求失败：{str(e)}"
+    })
 
 def process_tool_calls(response_message, tool_calls, temperature, max_tokens):
     """处理工具调用"""
