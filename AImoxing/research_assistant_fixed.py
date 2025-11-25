@@ -78,10 +78,20 @@ def is_mobile():
 # 初始化OpenRouter客户端
 @st.cache_resource
 def init_client():
+    api_key = st.secrets["OPENROUTER_API_KEY"]
+    
+    # 添加详细的调试信息
+    st.sidebar.write(f"🔑 API密钥格式: {api_key[:20]}...")
+    
     return OpenAI(
         base_url="https://openrouter.ai/api/v1",
-        api_key=st.secrets["OPENROUTER_API_KEY"],  # 使用secrets
+        api_key=api_key,
+        default_headers={
+            "HTTP-Referer": "https://research-assistant.streamlit.app",  # 您的应用URL
+            "X-Title": "AI Research Assistant",
+        }
     )
+
 client = init_client()
 
 # 工具函数定义（保持不变）
