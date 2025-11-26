@@ -1,9 +1,10 @@
 import streamlit as st
-from openai import OpenAI
+import google.generativeai as genai
 import requests
 import json
 import math
 from datetime import datetime
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 # 设置页面配置（移动端优化）
 st.set_page_config(
@@ -75,22 +76,26 @@ def is_mobile():
     except:
         return False
 
-# 初始化OpenRouter客户端
+# 初始化Gemini客户端
 @st.cache_resource
 def init_client():
-    api_key = st.secrets["OPENROUTER_API_KEY"]
-    
-    # 添加详细的调试信息
-    st.sidebar.write(f"🔑 API密钥格式: {api_key[:20]}...")
-    
-    return OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key,
-        default_headers={
-            "HTTP-Referer": "https://research-assistant.streamlit.app",  # 您的应用URL
-            "X-Title": "AI Research Assistant",
-        }
-    )
+    try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+        
+        # 添加详细的调试信息
+        st.sidebar.write(f"🔑 Gemini API密钥格式: {api_key[:10]}...")
+        
+        # 配置Gemini
+        genai.configure(api_key=api_key)
+        
+        # 创建模型实例 - 使用Gemini 2.5 Flash
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')  # 当前可用的最新版本
+        
+        st.sidebar.success("✅ Gemini客户端初始化成功")
+        return model
+    except Exception as e:
+        st.sidebar.error(f"❌ Gemini客户端初始化失败: {e}")
+        return None
 
 client = init_client()
 
@@ -187,6 +192,58 @@ TOOLS = [
     }
 ]
 
+def parse_gemini_response_for_tools(response_text):
+    """解析Gemini的响应，识别工具调用"""
+    tool_calls = []
+    
+    # 简单的关键词匹配来识别工具调用意图
+    if "搜索" in response_text or "查询" in response_text or "查找" in response_text:
+        # 提取搜索关键词
+        import re
+        search_patterns = [
+            r'搜索["“”]([^"“”]+)["“”]',
+            r'查询["“”]([^"“”]+)["“”]',
+            r'查找["“”]([^"“”]+)["“”]'
+        ]
+        
+        for pattern in search_patterns:
+            matches = re.findall(pattern, response_text)
+            if matches:
+                tool_calls.append({
+                    "name": "web_search",
+                    "arguments": {"query": matches[0], "max_results": 3}
+                })
+                break
+    
+    # 识别数学计算
+    elif "计算" in response_text or "算一下" in response_text:
+        calc_patterns = [
+            r'计算["“”]([^"“”]+)["“”]',
+            r'算一下["“”]([^"“”]+)["“”]',
+            r'([0-9+\-*/(). ]+)[的]?结果'
+        ]
+        
+        for pattern in calc_patterns:
+            matches = re.findall(pattern, response_text)
+            if matches:
+                expression = matches[0].strip()
+                # 验证是否是合法的数学表达式
+                if any(op in expression for op in ['+', '-', '*', '/', '(', ')']):
+                    tool_calls.append({
+                        "name": "calculator",
+                        "arguments": {"expression": expression}
+                    })
+                break
+    
+    # 识别时间查询
+    elif "时间" in response_text or "现在几点" in response_text or "日期" in response_text:
+        tool_calls.append({
+            "name": "get_current_time",
+            "arguments": {}
+        })
+    
+    return tool_calls
+
 def main():
     # 移动端适配的标题
     if is_mobile():
@@ -250,9 +307,8 @@ def main():
     if user_input:
         process_user_input(user_input, temperature, max_tokens)
 
-# 以下 process_user_input 和 process_tool_calls 函数保持不变
 def process_user_input(user_input, temperature, max_tokens):
-    """处理用户输入"""
+    """处理用户输入 - 适配Gemini API"""
     user_message = {"role": "user", "content": user_input}
     st.session_state.chat_history.append(user_message)
     
@@ -261,66 +317,96 @@ def process_user_input(user_input, temperature, max_tokens):
     
     with st.chat_message("assistant"):
         try:
-            conversation_messages = [
-                {
-                    "role": "system", 
-                    "content": """你是一个专业的研究助手。你可以使用以下工具：
-                    - web_search: 搜索最新信息
-                    - calculator: 进行数学计算
-                    - get_current_time: 获取当前时间
-                    
-                    根据问题需要选择合适的工具。"""
+            if client is None:
+                raise Exception("Gemini客户端未正确初始化")
+            
+            # 构建对话历史
+            conversation_history = []
+            for msg in st.session_state.chat_history[-6:]:  # 只保留最近6条消息
+                conversation_history.append(f"{msg['role']}: {msg['content']}")
+            
+            # 构建系统提示和工具描述
+            system_prompt = f"""你是一个专业的研究助手。你可以使用以下工具：
+
+工具列表：
+1. web_search - 搜索网络获取最新信息，参数：query(搜索关键词), max_results(最大结果数)
+2. calculator - 计算数学表达式，参数：expression(数学表达式)
+3. get_current_time - 获取当前日期和时间，无参数
+
+使用规则：
+- 如果用户的问题需要实时信息，请使用web_search工具
+- 如果涉及数学计算，请使用calculator工具  
+- 如果需要当前时间，请使用get_current_time工具
+- 在回复中明确说明你要使用哪个工具以及参数
+
+对话历史：
+{chr(10).join(conversation_history)}
+
+用户问题：{user_input}
+
+请分析用户问题并决定是否需要使用工具："""
+            
+            # 调用Gemini API
+            response = client.generate_content(
+                system_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
+                ),
+                safety_settings={
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
                 }
-            ]
-            
-            recent_history = st.session_state.chat_history[-10:]
-            for msg in recent_history:
-                if "tool_calls" not in msg:
-                    conversation_messages.append({
-                        "role": msg["role"],
-                        "content": msg["content"]
-                    })
-            
-            response = client.chat.completions.create(
-                model="mistralai/mistral-7b-instruct:free",
-                messages=conversation_messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                temperature=temperature,
-                max_tokens=max_tokens
             )
             
-            response_message = response.choices[0].message
-            tool_calls = response_message.tool_calls
+            response_text = response.text if response.text else "我没有找到合适的工具来回答这个问题。"
+            
+            # 解析响应，识别工具调用
+            tool_calls = parse_gemini_response_for_tools(response_text)
             
             if tool_calls:
-                process_tool_calls(response_message, tool_calls, temperature, max_tokens)
+                # 模拟OpenAI格式的tool_calls
+                mock_tool_calls = []
+                for i, tool_call in enumerate(tool_calls):
+                    mock_tool_calls.append(type('MockToolCall', (), {
+                        'function': type('MockFunction', (), {
+                            'name': tool_call["name"],
+                            'arguments': json.dumps(tool_call["arguments"], ensure_ascii=False)
+                        })()
+                    })())
+                
+                process_tool_calls(
+                    type('MockResponse', (), {'content': response_text})(),
+                    mock_tool_calls,
+                    temperature,
+                    max_tokens
+                )
             else:
-                ai_content = response_message.content or "我没有找到合适的工具来回答这个问题。"
-                st.markdown(ai_content)
+                # 没有工具调用，直接显示回复
+                st.markdown(response_text)
                 st.session_state.chat_history.append({
                     "role": "assistant", 
-                    "content": ai_content
+                    "content": response_text
                 })
                 
         except Exception as e:
-    # 显示更详细的错误信息
-         st.error(f"❌ 详细错误信息：{str(e)}")
-    
-    # 检查API密钥是否存在
-         if "OPENROUTER_API_KEY" not in st.secrets:
-          st.error("❌ 在Streamlit Secrets中未找到 OPENROUTER_API_KEY")
-         else:
-          st.info(f"✅ API密钥已配置，长度: {len(st.secrets['OPENROUTER_API_KEY'])} 字符")
-    
-    # 显示完整的错误信息
-         import traceback
-         st.code(traceback.format_exc())
-    
-         st.session_state.chat_history.append({
-        "role": "assistant", 
-        "content": f"请求失败：{str(e)}"
-    })
+            # 显示更详细的错误信息
+            st.error(f"❌ 详细错误信息：{str(e)}")
+            
+            # 检查API密钥是否存在
+            if "GEMINI_API_KEY" not in st.secrets:
+                st.error("❌ 在Streamlit Secrets中未找到 GEMINI_API_KEY")
+            else:
+                st.info(f"✅ API密钥已配置，长度: {len(st.secrets['GEMINI_API_KEY'])} 字符")
+            
+            # 显示完整的错误信息
+            import traceback
+            st.code(traceback.format_exc())
+            
+            st.session_state.chat_history.append({
+                "role": "assistant", 
+                "content": f"请求失败：{str(e)}"
+            })
 
 def process_tool_calls(response_message, tool_calls, temperature, max_tokens):
     """处理工具调用"""
@@ -350,13 +436,13 @@ def process_tool_calls(response_message, tool_calls, temperature, max_tokens):
             st.json(json.loads(result))
         
         tool_results.append({
-            "tool_call_id": tool_call.id,
+            "tool_call_id": f"mock_{len(tool_results)}",
             "name": function_name,
             "result": result
         })
         
         tool_calls_info.append({
-            "id": tool_call.id,
+            "id": f"mock_{len(tool_calls_info)}",
             "name": function_name,
             "arguments": function_args
         })
@@ -364,48 +450,42 @@ def process_tool_calls(response_message, tool_calls, temperature, max_tokens):
     st.markdown("---")
     st.subheader("📝 最终回答")
     
-    final_messages = [
-        {
-            "role": "system", 
-            "content": "基于工具执行结果，给出完整的最终回答。引用具体的数据和信息。"
-        }
-    ]
-    
-    if response_message.content:
-        final_messages.append({
-            "role": "assistant",
-            "content": response_message.content
-        })
-    
+    # 构建包含工具结果的提示
+    tool_results_text = "工具执行结果：\n"
     for tool_result in tool_results:
-        final_messages.append({
-            "role": "tool",
-            "tool_call_id": tool_result["tool_call_id"],
-            "content": tool_result["result"]
-        })
+        result_data = json.loads(tool_result["result"])
+        if "error" not in result_data:
+            tool_results_text += f"- {tool_result['name']}: {result_data}\n"
     
-    final_messages.append({
-        "role": "user",
-        "content": "请基于以上工具执行结果，给出完整的回答"
-    })
+    final_prompt = f"""基于以下工具执行结果，给出完整的最终回答。引用具体的数据和信息。
+
+{response_message.content}
+
+{tool_results_text}
+
+请基于以上信息给出完整的回答："""
     
     try:
-        final_response = client.chat.completions.create(
-            model="mistralai/mistral-7b-instruct:free",
-            messages=final_messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True
+        if client is None:
+            raise Exception("Gemini客户端未正确初始化")
+            
+        final_response = client.generate_content(
+            final_prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+            )
         )
         
-        final_placeholder = st.empty()
-        final_content = ""
+        final_content = final_response.text if final_response.text else "无法生成最终回答"
         
-        for chunk in final_response:
-            if chunk.choices[0].delta.content:
-                content = chunk.choices[0].delta.content
-                final_content += content
-                final_placeholder.markdown(final_content + "▌")
+        # 模拟流式输出
+        final_placeholder = st.empty()
+        display_text = ""
+        for char in final_content:
+            display_text += char
+            final_placeholder.markdown(display_text + "▌")
+            # 添加微小延迟以模拟流式效果
         
         final_placeholder.markdown(final_content)
         
